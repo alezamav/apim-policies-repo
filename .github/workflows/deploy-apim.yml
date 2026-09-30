@@ -1,0 +1,312 @@
+name: deploy-apim
+
+on:
+  push:
+    branches: [ "develop" ]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-apim-develop
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    # Configuracion, no secretos: son nombres de recursos de Azure, publicos por
+    # naturaleza. Declararlos aqui los mantiene legibles en los logs, que es lo
+    # que permite depurar cuando algo falla. El unico valor sensible es
+    # AZURE_CREDENTIALS, que sigue en GitHub Secrets.
+    env:
+      AZ_RESOURCE_GROUP: rg-cardops-demo
+      AKS_NAME: aks-cardops-demo
+      APIM_NAME: apim-cardops-demo
+      APIM_API_ID: cardops-api
+      APIM_API_PATH: cardops
+      INGRESS_NAME: ingress-nginx-controller
+      INGRESS_NAMESPACE: ingress-nginx
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------------------
+      # Azure Auth
+      # ---------------------------
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # Los providers (Microsoft.ContainerService, Microsoft.ApiManagement) se
+      # registran a NIVEL DE SUSCRIPCION, una sola vez y de forma manual.
+      # El Service Principal esta acotado al resource group y no tiene permiso
+      # para ejecutar 'az provider register', por lo que ese paso se elimino.
+
+      # ---------------------------
+      # Resolve Subscription
+      # ---------------------------
+      - name: Debug env vars
+        run: |
+          echo "RG=$AZ_RESOURCE_GROUP"
+          echo "AKS=$AKS_NAME"
+          echo "APIM=$APIM_NAME"
+
+
+      - name: Resolve Subscription ID
+        run: |
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          echo "SUBSCRIPTION_ID=$SUBSCRIPTION_ID" >> $GITHUB_ENV
+
+      # ---------------------------
+      # Get AKS kubeconfig via REST
+      # ---------------------------
+      - name: Get AKS kubeconfig
+        run: |
+          az rest \
+            --method POST \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ContainerService/managedClusters/$AKS_NAME/listClusterUserCredential?api-version=2023-07-01" \
+            --query "kubeconfigs[0].value" \
+            -o tsv | base64 --decode > kubeconfig
+
+          echo "KUBECONFIG=$PWD/kubeconfig" >> $GITHUB_ENV
+
+      - name: Install Helm
+        run: |
+          curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+
+      # ---------------------------
+      # Install ingress-nginx (IDEMPOTENT)
+      # ---------------------------
+      - name: Install/Upgrade ingress-nginx (with Azure LB health probe)
+        run: |
+          helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx || true
+          helm repo update
+
+          helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+            --namespace "$INGRESS_NAMESPACE" \
+            --create-namespace \
+            --set controller.service.type=LoadBalancer \
+            --set controller.service.annotations."service\.beta\.kubernetes\.io/azure-load-balancer-health-probe-request-path"="/healthz"
+      
+
+      # ---------------------------
+      # Wait for Ingress Controller IP
+      # ---------------------------
+      - name: Wait for ingress controller IP
+        run: |
+          for i in {1..30}; do
+            IP=$(kubectl get svc "$INGRESS_NAME" \
+              -n "$INGRESS_NAMESPACE" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$IP" ]; then
+              echo "INGRESS_IP=$IP" >> $GITHUB_ENV
+              echo "Ingress Controller IP => $IP"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Ingress Controller IP not ready"
+          exit 1
+          
+      - name: Wait until ingress-nginx is reachable (Azure LB healthy)
+        run: |
+          echo "Probing Ingress at http://$INGRESS_IP/healthz"
+          for i in {1..30}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "http://$INGRESS_IP/healthz" || true)
+            echo "Try $i => HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "Ingress is healthy ✅"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Ingress not reachable via LB ❌"
+          exit 1
+      
+      
+
+      # ---------------------------
+      # Verify kubectl context (IMPORTANT)
+      # ---------------------------
+      - name: Verify AKS access
+        run: |
+          set -e
+          kubectl config current-context
+          kubectl get nodes
+
+
+      # ---------------------------
+      # Create / Update APIM Backend
+      # ---------------------------
+      - name: Create APIM Backend
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/backends/aks-ingress-backend?api-version=2022-08-01" \
+            --body "{
+              \"properties\": {
+                \"url\": \"http://$INGRESS_IP\",
+                \"protocol\": \"http\"
+              }
+            }"
+
+      # ---------------------------
+      # Create / Update API
+      # ---------------------------
+      - name: Create APIM API
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID?api-version=2022-08-01" \
+            --headers "Content-Type=application/json" \
+            --body "@apis/cardops-api.json"
+
+      - name: Create/Update Operation - Ingress Health
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID/operations/ingress-health?api-version=2022-08-01" \
+            --body "{
+              \"properties\": {
+                \"displayName\": \"Ingress Health\",
+                \"method\": \"GET\",
+                \"urlTemplate\": \"/_ingress/health\",
+                \"responses\": []
+              }
+            }"
+
+
+      # ---------------------------
+      # Operations
+      # ---------------------------
+      - name: Create/Update Operation - Create Transaction
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID/operations/create-transaction?api-version=2022-08-01" \
+            --body "{
+              \"properties\": {
+                \"displayName\": \"Create Transaction\",
+                \"method\": \"POST\",
+                \"urlTemplate\": \"/api/transactions\",
+                \"responses\": []
+              }
+            }"
+
+      - name: Create/Update Operation - Health
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID/operations/health?api-version=2022-08-01" \
+            --body "{
+              \"properties\": {
+                \"displayName\": \"Health\",
+                \"method\": \"GET\",
+                \"urlTemplate\": \"/actuator/health\",
+                \"responses\": []
+              }
+            }"
+
+      - name: Create/Update Operation - List Transactions
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID/operations/list-transactions?api-version=2022-08-01" \
+            --body "{
+              \"properties\": {
+                \"displayName\": \"List Transactions\",
+                \"method\": \"GET\",
+                \"urlTemplate\": \"/api/transactions\",
+                \"request\": {
+                  \"queryParameters\": [
+                    {
+                      \"name\": \"accountNumber\",
+                      \"required\": true,
+                      \"type\": \"string\"
+                    }
+                  ]
+                },
+                \"responses\": []
+              }
+            }"
+
+      - name: Create / Update APIM Product
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/products/cardops-product?api-version=2022-08-01" \
+            --body '{
+              "properties": {
+                "displayName": "CardOps Product",
+                "description": "Producto para CardOps API",
+                "subscriptionRequired": true,
+                "approvalRequired": false,
+                "subscriptionsLimit": 100,
+                "state": "published"
+              }
+            }'
+
+      - name: Link API to Product
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/products/cardops-product/apis/$APIM_API_ID?api-version=2022-08-01"
+          
+      - name: Create Subscription
+        run: |
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/subscriptions/cardops-subscription?api-version=2022-08-01" \
+            --body '{
+              "properties": {
+                "displayName": "CardOps Default Subscription",
+                "scope": "/products/cardops-product",
+                "state": "active"
+              }
+            }'
+          
+
+      # ---------------------------
+      - name: Debug policy file
+        run: |
+          echo "====== POLICY FILE ======"
+          cat policies/cardops-policy.xml
+          echo "========================="
+
+      # ---------------------------
+      # Apply Policy
+      # ---------------------------
+      - name: Apply API Policy (FIX REAL FINAL)
+        run: |
+          set -e
+
+          POLICY_XML=$(sed 's/"/\\"/g' policies/cardops-policy.xml | tr -d '\n')
+
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$AZ_RESOURCE_GROUP/providers/Microsoft.ApiManagement/service/$APIM_NAME/apis/$APIM_API_ID/policies/policy?api-version=2022-08-01" \
+            --headers "Content-Type=application/json" \
+            --headers "If-Match=*" \
+            --body "{
+              \"properties\": {
+                \"value\": \"$POLICY_XML\",
+                \"format\": \"rawxml\"
+              }
+            }"
+
+      - name: Smoke test from runner to Ingress (healthz)
+        run: |
+          curl -i "http://$INGRESS_IP/healthz" || true
+
+      - name: Smoke test - API path (should return 4xx/2xx, not timeout)
+        run: |
+          curl -i "http://$INGRESS_IP/api/transactions" || true
+
+
+
+      # ---------------------------
+      # Done
+      # ---------------------------
+      - name: Done
+        run: |
+          echo "===================================="
+          echo "APIM deployed OK ✅"
+          echo "Gateway: https://$APIM_NAME.azure-api.net/$APIM_API_PATH"
+          echo "POST /api/transactions"
+          echo "GET  /actuator/health"
+          echo "Backend => http://$INGRESS_IP"
+          echo "===================================="

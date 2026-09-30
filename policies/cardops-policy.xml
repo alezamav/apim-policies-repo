@@ -1,0 +1,38 @@
+<policies>
+    <inbound>
+        <base />
+        <rate-limit calls="100" renewal-period="60" />
+        <set-header name="Expect" exists-action="delete" />
+        <set-backend-service backend-id="aks-ingress-backend" />
+
+        <rewrite-uri template="@{
+        var path = context.Request.Url.Path;
+
+        /* Health del ingress vía APIM */
+        if (path.Equals(&quot;/_ingress/health&quot;))
+        {
+            return &quot;/healthz&quot;;
+        }
+
+        /* Si publicas con /cardops delante, quítalo */
+        if (path.StartsWith(&quot;/cardops&quot;))
+        {
+            return path.Substring(8);
+        }
+
+        return path;
+    }" />
+    </inbound>
+
+    <backend>
+        <forward-request timeout="60" />
+    </backend>
+
+    <outbound>
+        <base />
+    </outbound>
+
+    <on-error>
+        <base />
+    </on-error>
+</policies>

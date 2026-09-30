@@ -1,0 +1,33 @@
+# IDEs
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+
+# Logs
+*.log
+logs/
+
+# Azure / credenciales (NUNCA commitear)
+*.publishsettings
+azureauth.json
+*credentials*.json
+.azure/
+local.settings.json
+*.pem
+*.key
+*.pfx
+
+# PowerShell
+*.ps1.bak
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporales
+*.tmp
+*.swp
+*~

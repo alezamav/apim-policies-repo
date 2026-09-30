@@ -1,0 +1,8 @@
+{
+  "properties": {
+    "displayName": "Card Ops API",
+    "path": "cardops",
+    "protocols": ["https"],
+    "subscriptionRequired": false
+  }
+}

@@ -1,0 +1,16 @@
+# Normaliza finales de linea: LF en el repositorio, nativo en el working copy
+* text=auto
+
+# Scripts ejecutados por runners Linux (pwsh en ubuntu-latest) -> siempre LF
+*.ps1   text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
+
+# Binarios: sin conversion
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.zip   binary
+*.jar   binary
